@@ -444,22 +444,45 @@ def process_image_message(reply_token: str, user_id: str, message_id: str):
             ext = "png"
         filename = f"{message_id}.{ext}"
 
-        # c. อัปโหลดไฟล์เข้า Google Drive API v3
+        # c. อัปโหลดไฟล์เข้า Google Drive API v3 (เปิด supportsAllDrives=True)
         file_metadata = {
             "name": filename,
             "parents": [DRIVE_FOLDER_ID]
         }
-        media = MediaIoBaseUpload(io.BytesIO(image_bytes), mimetype="image/jpeg", resumable=True)
-        uploaded_file = drive_service.files().create(
-            body=file_metadata,
-            media_body=media,
-            fields="id"
-        ).execute()
-
-        print(f"✅ อัปโหลดไฟล์ {filename} เข้า Google Drive สำเร็จ! (File ID: {uploaded_file.get('id')})")
-
-        # d. ตอบยืนยันกลับทาง LINE
-        reply_to_line(reply_token, "ได้รับรูปแล้ว บันทึกเข้าระบบฟาร์มกุ้งเรียบร้อยครับ 📁")
+        
+        try:
+            media = MediaIoBaseUpload(io.BytesIO(image_bytes), mimetype="image/jpeg", resumable=True)
+            uploaded_file = drive_service.files().create(
+                body=file_metadata,
+                media_body=media,
+                fields="id",
+                supportsAllDrives=True
+            ).execute()
+            print(f"✅ อัปโหลดไฟล์ {filename} เข้า Google Drive สำเร็จ! (File ID: {uploaded_file.get('id')})")
+            reply_to_line(reply_token, "ได้รับรูปแล้ว บันทึกเข้าระบบฟาร์มกุ้งเรียบร้อยครับ 📁")
+            return
+        except Exception as drive_err:
+            print(f"⚠️ Drive API Upload failed ({drive_err}), trying GAS WebApp fallback...")
+            if GAS_WEBAPP_URL:
+                import base64
+                base64_str = base64.b64encode(image_bytes).decode("utf-8")
+                payload = {
+                    "action": "upload_image",
+                    "folder_id": DRIVE_FOLDER_ID,
+                    "filename": filename,
+                    "base64_data": base64_str
+                }
+                gas_res = requests.post(GAS_WEBAPP_URL, json=payload, timeout=20)
+                gas_res.raise_for_status()
+                gas_data = gas_res.json()
+                if gas_data.get("status") == "success":
+                    print(f"✅ อัปโหลดไฟล์ {filename} ผ่าน GAS WebApp สำเร็จ!")
+                    reply_to_line(reply_token, "ได้รับรูปแล้ว บันทึกเข้าระบบฟาร์มกุ้งเรียบร้อยครับ 📁")
+                    return
+                else:
+                    raise Exception(gas_data.get("message", "GAS Upload Failed"))
+            else:
+                raise drive_err
 
     except Exception as e:
         print(f"❌ เกิดข้อผิดพลาดในการอัปโหลดรูปภาพเข้า Google Drive: {e}")
