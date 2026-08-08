@@ -292,7 +292,7 @@ def clean_mentions(event_message) -> str:
         except Exception as e:
             print(f"⚠️ Error cleaning LINE mention metadata: {e}")
             
-    text = re.sub(r'(?<=^|\s)@[^\s]+', '', text)
+    text = re.sub(r'(?:^|\s)@[^\s]+', ' ', text)
     text = re.sub(r'\s+', ' ', text).strip()
     return text
 
