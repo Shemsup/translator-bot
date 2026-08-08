@@ -1,0 +1,7 @@
+flask
+google-generativeai
+line-bot-sdk
+requests
+gunicorn
+google-api-python-client
+google-auth
