@@ -178,7 +178,7 @@ Your tasks:
 3. ALWAYS relate the translations to the context of a shrimp farm business and its operations.
 4. If a message contains multiple lines or multiple speakers (e.g. "สมชาย: สวัสดี"), translate line by line, strictly preserving the speaker's name and original format.
 5. If there are mixed languages, translate the part that is not the target language of the reader.
-6. DO NOT output any conversational filler. Output ONLY the translated text.
+6. STRICTLY NO CONVERSATIONAL FILLER, NO EXPLANATIONS, NO PINYIN, NO VOCABULARY BREAKDOWNS. Output ONLY the translated text.
 7. Consider the conversation history for context, but only translate the LATEST message sent by the user.
 
 Here is the Glossary of specific terms you MUST use:
@@ -198,7 +198,11 @@ Here is the Glossary of specific terms you MUST use:
                 except Exception:
                     existing_history = []
             
-            model = genai.GenerativeModel("gemini-2.5-flash", system_instruction=prompt)
+            generation_config = {
+                "temperature": 0.2,
+                "max_output_tokens": 500,
+            }
+            model = genai.GenerativeModel("gemini-2.5-flash", system_instruction=prompt, generation_config=generation_config)
             chat = model.start_chat(history=existing_history)
             chat_sessions_translate[user_id] = {
                 "chat": chat,
@@ -410,26 +414,15 @@ def process_text_message(reply_token: str, user_id: str, text: str):
 def process_image_message(reply_token: str, user_id: str, message_id: str):
     print(f"📸 ได้รับรูปภาพจาก LINE User ID: {user_id}")
     
-    # 1. เช็กสิทธิ์ GEAR_USER_ID หากมีการกำหนดไว้เฉพาะเจาะจง
-    if GEAR_USER_ID and user_id != GEAR_USER_ID:
-        print(f"ℹ️ ข้ามรูปจาก User ID {user_id} เนื่องจากมีการจำกัดสิทธิ์เฉพาะ GEAR_USER_ID")
-        return
-
-    # 2. เช็กสิทธิ์ ALLOWED_USER_ID ทั่วไป
+    # 1. เช็กสิทธิ์ผู้ใช้งาน (รองรับทั้งคุณเช็ม, คุณเกียร์, และสมาชิกในกลุ่มฟาร์มกุ้ง)
     if not is_user_allowed(user_id):
         print(f"❌ Blocked image from unauthorized User ID: {user_id}")
         return
 
-    # 3. เช็กการตั้งค่าโฟลเดอร์ Google Drive
+    # 2. เช็กการตั้งค่าโฟลเดอร์ Google Drive
     if not DRIVE_FOLDER_ID:
         print("❌ Error: DRIVE_FOLDER_ID is not set in Environment Variables")
         reply_to_line(reply_token, "❌ ระบบยังไม่ได้ตั้งค่า DRIVE_FOLDER_ID ในระบบคลาวด์ ไม่สามารถอัปโหลดรูปภาพได้ครับ", user_id=user_id)
-        return
-
-    # 4. เรียกใช้ Google Drive Service
-    drive_service = get_drive_service()
-    if not drive_service:
-        reply_to_line(reply_token, "❌ ไม่สามารถเชื่อมต่อ Google Drive API ได้ กรุณาตรวจสอบการตั้งค่า Service Account", user_id=user_id)
         return
 
     try:
@@ -447,26 +440,10 @@ def process_image_message(reply_token: str, user_id: str, message_id: str):
             ext = "png"
         filename = f"{message_id}.{ext}"
 
-        # c. อัปโหลดไฟล์เข้า Google Drive API v3 (เปิด supportsAllDrives=True)
-        file_metadata = {
-            "name": filename,
-            "parents": [DRIVE_FOLDER_ID]
-        }
-        
-        try:
-            media = MediaIoBaseUpload(io.BytesIO(image_bytes), mimetype="image/jpeg", resumable=True)
-            uploaded_file = drive_service.files().create(
-                body=file_metadata,
-                media_body=media,
-                fields="id",
-                supportsAllDrives=True
-            ).execute()
-            print(f"✅ อัปโหลดไฟล์ {filename} เข้า Google Drive สำเร็จ! (File ID: {uploaded_file.get('id')})")
-            reply_to_line(reply_token, "ได้รับรูปแล้ว บันทึกเข้าระบบฟาร์มกุ้งเรียบร้อยครับ 📁", user_id=user_id)
-            return
-        except Exception as drive_err:
-            print(f"⚠️ Drive API Upload failed ({drive_err}), trying GAS WebApp fallback...")
-            if GAS_WEBAPP_URL:
+        # c. อัปโหลดไฟล์เข้า Google Drive
+        # 1. วิธีหลัก: ผ่าน GAS WebApp (รวดเร็ว ~1.5 วินาที และใช้พื้นที่บัญชีส่วนตัวของคุณเช็มโดยตรง ไม่ติด Quota Limit)
+        if GAS_WEBAPP_URL:
+            try:
                 import base64
                 base64_str = base64.b64encode(image_bytes).decode("utf-8")
                 payload = {
@@ -479,13 +456,33 @@ def process_image_message(reply_token: str, user_id: str, message_id: str):
                 gas_res.raise_for_status()
                 gas_data = gas_res.json()
                 if gas_data.get("status") == "success":
-                    print(f"✅ อัปโหลดไฟล์ {filename} ผ่าน GAS WebApp สำเร็จ!")
+                    print(f"✅ อัปโหลดไฟล์ {filename} ผ่าน GAS WebApp สำเร็จ! (File ID: {gas_data.get('id')})")
                     reply_to_line(reply_token, "ได้รับรูปแล้ว บันทึกเข้าระบบฟาร์มกุ้งเรียบร้อยครับ 📁", user_id=user_id)
                     return
                 else:
-                    raise Exception(gas_data.get("message", "GAS Upload Failed"))
-            else:
-                raise drive_err
+                    print(f"⚠️ GAS WebApp error: {gas_data.get('message')}")
+            except Exception as gas_err:
+                print(f"⚠️ GAS Upload failed ({gas_err}), trying Service Account fallback...")
+
+        # 2. วิธีสำรอง: ผ่าน Google Drive API v3 โดยตรง
+        drive_service = get_drive_service()
+        if drive_service:
+            file_metadata = {
+                "name": filename,
+                "parents": [DRIVE_FOLDER_ID]
+            }
+            media = MediaIoBaseUpload(io.BytesIO(image_bytes), mimetype="image/jpeg", resumable=True)
+            uploaded_file = drive_service.files().create(
+                body=file_metadata,
+                media_body=media,
+                fields="id",
+                supportsAllDrives=True
+            ).execute()
+            print(f"✅ อัปโหลดไฟล์ {filename} เข้า Google Drive สำเร็จ! (File ID: {uploaded_file.get('id')})")
+            reply_to_line(reply_token, "ได้รับรูปแล้ว บันทึกเข้าระบบฟาร์มกุ้งเรียบร้อยครับ 📁", user_id=user_id)
+            return
+
+        raise Exception("ไม่สามารถอัปโหลดได้ทั้งช่องทาง GAS WebApp และ Drive API")
 
     except Exception as e:
         print(f"❌ เกิดข้อผิดพลาดในการอัปโหลดรูปภาพเข้า Google Drive: {e}")
@@ -550,6 +547,22 @@ def handle_image_message(event):
     
     thread = threading.Thread(target=process_image_message, args=(reply_token, user_id, message_id))
     thread.start()
+
+# ============================================================
+# 💓 Keep-Alive Daemon Worker (ป้องกัน Render Free Tier หลับ)
+# ============================================================
+def keep_alive_worker():
+    time.sleep(30)
+    print("💓 เริ่มต้นระบบ Keep-Alive daemon ป้องกันเซิร์ฟเวอร์หลับ...")
+    while True:
+        try:
+            r = requests.get("https://translator-bot-le71.onrender.com/health", timeout=15)
+            print(f"💓 Keep-alive ping สำเร็จ (Status: {r.status_code})")
+        except Exception as e:
+            print(f"⚠️ Keep-alive ping failed: {e}")
+        time.sleep(8 * 60) # ping ทุก 8 นาที ก่อน Render จะหลับที่นาทีที่ 15
+
+threading.Thread(target=keep_alive_worker, daemon=True).start()
 
 if __name__ == "__main__":
     print("==================================================")
