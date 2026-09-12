@@ -510,6 +510,16 @@ def callback():
 def health():
     return "OK", 200
 
+@app.route("/debug-config", methods=["GET"])
+def debug_config():
+    return {
+        "ALLOWED_USER_ID": ALLOWED_USER_ID,
+        "GEAR_USER_ID": GEAR_USER_ID,
+        "DRIVE_FOLDER_ID": DRIVE_FOLDER_ID,
+        "HAS_GAS": bool(GAS_WEBAPP_URL),
+        "HAS_SERVICE_ACCOUNT": bool(GOOGLE_SERVICE_ACCOUNT_JSON)
+    }, 200
+
 # ============================================================
 # LINE Event Listeners
 # ============================================================
