@@ -39,7 +39,9 @@ if CHANNEL_ACCESS_TOKEN and CHANNEL_SECRET:
     line_bot_api = LineBotApi(CHANNEL_ACCESS_TOKEN)
     handler = WebhookHandler(CHANNEL_SECRET)
 else:
-    print("⚠️ Warning: LINE API keys are not set yet!")
+    print("⚠️ Warning: LINE API keys are not set yet! Using dummy instances for safety.")
+    line_bot_api = LineBotApi(CHANNEL_ACCESS_TOKEN or "dummy_channel_access_token")
+    handler = WebhookHandler(CHANNEL_SECRET or "dummy_channel_secret")
 
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
@@ -79,64 +81,56 @@ def get_drive_service():
 # 🛡️ ระบบตรวจสอบสิทธิ์ผู้ใช้งาน (Authorization Check)
 # ============================================================
 def is_user_allowed(user_id: str) -> bool:
-    if not ALLOWED_USER_ID or ALLOWED_USER_ID in ["ใส่_LINE_USER_ID_ตรงนี้", "*"]:
+    if not ALLOWED_USER_ID or ALLOWED_USER_ID in ["ใส่_LINE_USER_ID_ตรงนี้", "*", "ALL"]:
+        return True
+    if not user_id:
         return True
     allowed_list = [uid.strip() for uid in ALLOWED_USER_ID.split(",") if uid.strip()]
     return user_id in allowed_list
 
 # ============================================================
-# 📚 ระบบ Glossary Cache (In-Memory Caching พร้อม TTL)
+# 📚 ระบบ Glossary Cache (In-Memory โหลดทันที ไม่บล็อก Thread)
 # ============================================================
+def load_local_glossary() -> str:
+    glossary_path = os.path.join(os.path.dirname(__file__), "glossary.md")
+    if os.path.exists(glossary_path):
+        try:
+            with open(glossary_path, "r", encoding="utf-8") as f:
+                lines = []
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith("#") and not line.startswith("---") and not line.startswith("`") and "=" in line:
+                        lines.append(line)
+                return "\n".join(lines)
+        except Exception as e:
+            print(f"⚠️ Error reading local glossary.md: {e}")
+    return ""
+
 GLOSSARY_CACHE = {
-    "text": "",
-    "timestamp": 0
+    "text": load_local_glossary(),
+    "timestamp": time.time()
 }
-GLOSSARY_TTL_SECONDS = 300  # Cache อยู่ได้ 5 นาที
 glossary_lock = threading.Lock()
 
 def get_glossary(force_refresh: bool = False) -> str:
-    current_time = time.time()
     with glossary_lock:
-        if not force_refresh and GLOSSARY_CACHE["text"] and (current_time - GLOSSARY_CACHE["timestamp"] < GLOSSARY_TTL_SECONDS):
+        if not force_refresh and GLOSSARY_CACHE["text"]:
             return GLOSSARY_CACHE["text"]
+    text = load_local_glossary()
+    with glossary_lock:
+        GLOSSARY_CACHE["text"] = text
+        GLOSSARY_CACHE["timestamp"] = time.time()
+    return text or "No glossary found."
 
-    # 1. พยายามดึงแบบเรียลไทม์จาก GAS Web App (Timeout 4s)
-    if GAS_WEBAPP_URL:
-        try:
-            response = requests.post(GAS_WEBAPP_URL, json={"action": "get_all"}, timeout=4)
-            response.raise_for_status()
-            res_data = response.json()
-            if res_data.get("status") == "success":
-                items = res_data.get("data", [])
-                glossary_lines = [f"{item['thai']} = {item['chinese']}" for item in items if 'thai' in item and 'chinese' in item]
-                glossary_text = "\n".join(glossary_lines)
-                with glossary_lock:
-                    GLOSSARY_CACHE["text"] = glossary_text
-                    GLOSSARY_CACHE["timestamp"] = time.time()
-                print("✅ โหลดคำศัพท์เรียลไทม์จาก GAS สำเร็จ")
-                return glossary_text
-        except Exception as e:
-            print(f"⚠️ ดึงศัพท์จาก GAS ไม่สำเร็จ (ลอง CSV สำรอง): {e}")
-
-    # 2. หากดึงจาก GAS ไม่สำเร็จ ให้ดึงจาก CSV URL สำรอง (Timeout 5s)
-    try:
-        response = requests.get(CSV_URL, timeout=5)
-        response.raise_for_status()
-        csv_reader = csv.reader(io.StringIO(response.text))
-        glossary_lines = [f"{row[0]} = {row[1]}" for row in csv_reader if len(row) >= 2]
-        glossary_text = "\n".join(glossary_lines)
-        with glossary_lock:
-            GLOSSARY_CACHE["text"] = glossary_text
-            GLOSSARY_CACHE["timestamp"] = time.time()
-        print("✅ โหลดคำศัพท์จาก CSV สำรองสำเร็จ")
-        return glossary_text
-    except Exception as e:
-        print(f"❌ Error fetching glossary CSV: {e}")
-        with glossary_lock:
-            if GLOSSARY_CACHE["text"]:
-                print("ℹ️ ใช้ Glossary ล่าสุดที่มีใน Cache แทน")
-                return GLOSSARY_CACHE["text"]
-        return "No glossary found."
+def add_glossary_term(thai_word: str, chinese_word: str):
+    entry = f"{thai_word} = {chinese_word}"
+    with glossary_lock:
+        if GLOSSARY_CACHE["text"]:
+            GLOSSARY_CACHE["text"] = entry + "\n" + GLOSSARY_CACHE["text"]
+        else:
+            GLOSSARY_CACHE["text"] = entry
+        GLOSSARY_CACHE["timestamp"] = time.time()
+    print(f"✅ เพิ่มคำศัพท์เข้าหน่วยความจำ: {entry}")
 
 def invalidate_glossary_cache():
     with glossary_lock:
@@ -268,11 +262,19 @@ Here is the Glossary of specific terms you can reference:
 # ============================================================
 # ระบบส่งข้อความกลับไปทาง LINE (พร้อม Error Handling)
 # ============================================================
-def reply_to_line(reply_token: str, text: str):
+def reply_to_line(reply_token: str, text: str, user_id: str = None):
     try:
         line_bot_api.reply_message(reply_token, TextSendMessage(text=text))
+        print("✅ ตอบกลับผ่าน LINE สำเร็จ")
     except Exception as e:
-        print(f"❌ Fail to reply to LINE: {e}")
+        print(f"❌ Fail to reply to LINE via reply_token: {e}")
+        if user_id:
+            try:
+                print(f"🔄 กำลังลองส่งข้อความผ่าน push_message ไปยัง User: {user_id}...")
+                line_bot_api.push_message(user_id, TextSendMessage(text=text))
+                print("✅ ส่งผ่าน push_message สำเร็จ!")
+            except Exception as push_err:
+                print(f"❌ Fail to push to LINE: {push_err}")
 
 # ============================================================
 # ระบบทำความสะอาดข้อความ ลบเครื่องหมายแท็กคนอื่นออก (@Name)
@@ -312,13 +314,13 @@ def process_text_message(reply_token: str, user_id: str, text: str):
             chat_sessions_translate.pop(user_id, None)
             chat_sessions_explain.pop(user_id, None)
         print(f"🧹 รีเซ็ตความจำสำหรับ User ID: {user_id}")
-        reply_to_line(reply_token, "🔄 รีเซ็ตความจำเรียบร้อยแล้วครับ เริ่มนับหนึ่งใหม่!")
+        reply_to_line(reply_token, "🔄 รีเซ็ตความจำเรียบร้อยแล้วครับ เริ่มนับหนึ่งใหม่!", user_id=user_id)
         return
 
     # 2. 📋 โหมดดูคำศัพท์ล่าสุด (++)
     if text_strip == "++":
         if not GAS_WEBAPP_URL:
-            reply_to_line(reply_token, "❌ ไม่พบการตั้งค่า GAS_WEBAPP_URL บนระบบคลาวด์ ไม่สามารถดึงคลังคำศัพท์ได้")
+            reply_to_line(reply_token, "❌ ไม่พบการตั้งค่า GAS_WEBAPP_URL บนระบบคลาวด์ ไม่สามารถดึงคลังคำศัพท์ได้", user_id=user_id)
             return
         
         try:
@@ -329,27 +331,23 @@ def process_text_message(reply_token: str, user_id: str, text: str):
             if res_data.get("status") == "success":
                 items = res_data.get("data", [])
                 if not items:
-                    reply_to_line(reply_token, "📋 ยังไม่มีคำศัพท์ถูกบันทึกไว้ในคลังคลาสครับ")
+                    reply_to_line(reply_token, "📋 ยังไม่มีคำศัพท์ถูกบันทึกไว้ในคลังคลาสครับ", user_id=user_id)
                 else:
                     reply_lines = ["📋 คำศัพท์ 5 รายการล่าสุดในคลัง:"]
                     for idx, item in enumerate(items, 1):
                         reply_lines.append(f"{idx}. {item['thai']} = {item['chinese']}")
-                    reply_to_line(reply_token, "\n".join(reply_lines))
+                    reply_to_line(reply_token, "\n".join(reply_lines), user_id=user_id)
             else:
-                reply_to_line(reply_token, f"❌ ดึงข้อมูลจาก Sheets ล้มเหลว: {res_data.get('message')}")
+                reply_to_line(reply_token, f"❌ ดึงข้อมูลจาก Sheets ล้มเหลว: {res_data.get('message')}", user_id=user_id)
         except Exception as e:
-            reply_to_line(reply_token, f"❌ เกิดข้อผิดพลาดในการเชื่อมต่อ Google Sheets: {e}")
+            reply_to_line(reply_token, f"❌ เกิดข้อผิดพลาดในการเชื่อมต่อ Google Sheets: {e}", user_id=user_id)
         return
 
     # 3. ✍️ โหมดบันทึกคำศัพท์ (+)
     if text_strip.startswith("+"):
-        if not GAS_WEBAPP_URL:
-            reply_to_line(reply_token, "❌ ไม่พบการตั้งค่า GAS_WEBAPP_URL บนระบบคลาวด์ ไม่สามารถบันทึกคำศัพท์ได้")
-            return
-            
         content = text_strip[1:].strip()
         if "=" not in content:
-            reply_to_line(reply_token, "⚠️ รูปแบบคำสั่งบันทึกไม่ถูกต้อง\nกรุณาใช้: +[คำไทย] = [คำจีน]\nตัวอย่างเช่น: +สีกันสนิม = 防锈漆")
+            reply_to_line(reply_token, "⚠️ รูปแบบคำสั่งบันทึกไม่ถูกต้อง\nกรุณาใช้: +[คำไทย] = [คำจีน]\nตัวอย่างเช่น: +สีกันสนิม = 防锈漆", user_id=user_id)
             return
             
         parts = content.split("=", 1)
@@ -357,7 +355,14 @@ def process_text_message(reply_token: str, user_id: str, text: str):
         chinese_word = parts[1].strip()
         
         if not thai_word or not chinese_word:
-            reply_to_line(reply_token, "⚠️ กรุณากรอกทั้งคำไทยและคำจีนให้ครบถ้วน\nตัวอย่างเช่น: +สีกันสนิม = 防锈漆")
+            reply_to_line(reply_token, "⚠️ กรุณากรอกทั้งคำไทยและคำจีนให้ครบถ้วน\nตัวอย่างเช่น: +สีกันสนิม = 防锈漆", user_id=user_id)
+            return
+            
+        # เพิ่มเข้าหน่วยความจำทันทีเพื่อให้ AI นำไปใช้ได้ในแชทถัดไป
+        add_glossary_term(thai_word, chinese_word)
+        
+        if not GAS_WEBAPP_URL:
+            reply_to_line(reply_token, f"✍️ บันทึก \"{thai_word} = {chinese_word}\" เข้าหน่วยความจำเรียบร้อยแล้วครับ!", user_id=user_id)
             return
             
         try:
@@ -371,13 +376,11 @@ def process_text_message(reply_token: str, user_id: str, text: str):
             res_data = response.json()
             
             if res_data.get("status") == "success":
-                invalidate_glossary_cache()
-                get_glossary(force_refresh=True)
-                reply_to_line(reply_token, f"✍️ บันทึก \"{thai_word} = {chinese_word}\" ลง Google Sheets เรียบร้อยแล้วครับ!")
+                reply_to_line(reply_token, f"✍️ บันทึก \"{thai_word} = {chinese_word}\" ลง Google Sheets เรียบร้อยแล้วครับ!", user_id=user_id)
             else:
-                reply_to_line(reply_token, f"❌ บันทึกข้อมูลล้มเหลว: {res_data.get('message')}")
+                reply_to_line(reply_token, f"✍️ บันทึกในบอทแล้ว แต่บันทึกลง Sheets ไม่สำเร็จ: {res_data.get('message')}", user_id=user_id)
         except Exception as e:
-            reply_to_line(reply_token, f"❌ เกิดข้อผิดพลาดในการบันทึกข้อมูลไป Google Sheets: {e}")
+            reply_to_line(reply_token, f"✍️ บันทึกในบอทแล้ว แต่ส่งไป Sheets ล้มเหลว: {e}", user_id=user_id)
         return
 
     # 4. 💬 โหมดขอคำอธิบาย (?) หรือแชทปกติ
@@ -395,11 +398,11 @@ def process_text_message(reply_token: str, user_id: str, text: str):
             
         response = chat.send_message(query_text)
         translated_text = response.text.strip()
-        reply_to_line(reply_token, translated_text)
+        reply_to_line(reply_token, translated_text, user_id=user_id)
         print("✅ ประมวลผลและตอบกลับผ่าน LINE สำเร็จ")
     except Exception as e:
         print(f"❌ Error during Gemini processing: {e}")
-        reply_to_line(reply_token, f"❌ เกิดข้อผิดพลาดในการประมวลผล AI: {e}")
+        reply_to_line(reply_token, f"❌ เกิดข้อผิดพลาดในการประมวลผล AI: {e}", user_id=user_id)
 
 # ============================================================
 # 📁 ตัวประมวลผลรูปภาพ อัปโหลดเข้า Google Drive (Image Mode)
@@ -420,13 +423,13 @@ def process_image_message(reply_token: str, user_id: str, message_id: str):
     # 3. เช็กการตั้งค่าโฟลเดอร์ Google Drive
     if not DRIVE_FOLDER_ID:
         print("❌ Error: DRIVE_FOLDER_ID is not set in Environment Variables")
-        reply_to_line(reply_token, "❌ ระบบยังไม่ได้ตั้งค่า DRIVE_FOLDER_ID ในระบบคลาวด์ ไม่สามารถอัปโหลดรูปภาพได้ครับ")
+        reply_to_line(reply_token, "❌ ระบบยังไม่ได้ตั้งค่า DRIVE_FOLDER_ID ในระบบคลาวด์ ไม่สามารถอัปโหลดรูปภาพได้ครับ", user_id=user_id)
         return
 
     # 4. เรียกใช้ Google Drive Service
     drive_service = get_drive_service()
     if not drive_service:
-        reply_to_line(reply_token, "❌ ไม่สามารถเชื่อมต่อ Google Drive API ได้ กรุณาตรวจสอบการตั้งค่า Service Account")
+        reply_to_line(reply_token, "❌ ไม่สามารถเชื่อมต่อ Google Drive API ได้ กรุณาตรวจสอบการตั้งค่า Service Account", user_id=user_id)
         return
 
     try:
@@ -459,7 +462,7 @@ def process_image_message(reply_token: str, user_id: str, message_id: str):
                 supportsAllDrives=True
             ).execute()
             print(f"✅ อัปโหลดไฟล์ {filename} เข้า Google Drive สำเร็จ! (File ID: {uploaded_file.get('id')})")
-            reply_to_line(reply_token, "ได้รับรูปแล้ว บันทึกเข้าระบบฟาร์มกุ้งเรียบร้อยครับ 📁")
+            reply_to_line(reply_token, "ได้รับรูปแล้ว บันทึกเข้าระบบฟาร์มกุ้งเรียบร้อยครับ 📁", user_id=user_id)
             return
         except Exception as drive_err:
             print(f"⚠️ Drive API Upload failed ({drive_err}), trying GAS WebApp fallback...")
@@ -477,7 +480,7 @@ def process_image_message(reply_token: str, user_id: str, message_id: str):
                 gas_data = gas_res.json()
                 if gas_data.get("status") == "success":
                     print(f"✅ อัปโหลดไฟล์ {filename} ผ่าน GAS WebApp สำเร็จ!")
-                    reply_to_line(reply_token, "ได้รับรูปแล้ว บันทึกเข้าระบบฟาร์มกุ้งเรียบร้อยครับ 📁")
+                    reply_to_line(reply_token, "ได้รับรูปแล้ว บันทึกเข้าระบบฟาร์มกุ้งเรียบร้อยครับ 📁", user_id=user_id)
                     return
                 else:
                     raise Exception(gas_data.get("message", "GAS Upload Failed"))
@@ -486,7 +489,7 @@ def process_image_message(reply_token: str, user_id: str, message_id: str):
 
     except Exception as e:
         print(f"❌ เกิดข้อผิดพลาดในการอัปโหลดรูปภาพเข้า Google Drive: {e}")
-        reply_to_line(reply_token, f"❌ เกิดข้อผิดพลาดในการบันทึกรูปภาพเข้าระบบ Google Drive: {e}")
+        reply_to_line(reply_token, f"❌ เกิดข้อผิดพลาดในการบันทึกรูปภาพเข้าระบบ Google Drive: {e}", user_id=user_id)
 
 # ============================================================
 # Webhook Route & Health Check
@@ -512,7 +515,7 @@ def health():
 # ============================================================
 @handler.add(MessageEvent, message=TextMessage)
 def handle_text_message(event):
-    user_id = event.source.user_id
+    user_id = getattr(event.source, 'user_id', None)
     reply_token = event.reply_token
     
     text = clean_mentions(event.message)
@@ -529,7 +532,7 @@ def handle_text_message(event):
 
 @handler.add(MessageEvent, message=ImageMessage)
 def handle_image_message(event):
-    user_id = event.source.user_id
+    user_id = getattr(event.source, 'user_id', None)
     message_id = event.message.id
     reply_token = event.reply_token
     
