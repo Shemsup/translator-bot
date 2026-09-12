@@ -16,7 +16,27 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 
+from collections import deque
+import sys
+
 app = Flask(__name__)
+
+# ระบบจัดเก็บ Logs ในหน่วยความจำ เพื่อเช็กสถานะสดผ่าน /logs
+class LiveLogBuffer:
+    def __init__(self, stream):
+        self.stream = stream
+        self.buffer = deque(maxlen=150)
+    def write(self, msg):
+        if msg.strip():
+            ts = time.strftime('%H:%M:%S')
+            self.buffer.append(f"[{ts}] {msg.strip()}")
+        self.stream.write(msg)
+    def flush(self):
+        self.stream.flush()
+
+log_buffer = LiveLogBuffer(sys.stdout)
+sys.stdout = log_buffer
+sys.stderr = log_buffer
 
 # ============================================================
 # ⚙️ ตั้งค่า Keys (ดึงจาก Environment Variables บน Render)
@@ -516,6 +536,10 @@ def debug_config():
         "HAS_GAS": bool(GAS_WEBAPP_URL),
         "HAS_SERVICE_ACCOUNT": bool(GOOGLE_SERVICE_ACCOUNT_JSON)
     }, 200
+
+@app.route("/logs", methods=["GET"])
+def get_logs():
+    return "<pre style='font-family:monospace; background:#111; color:#0f0; padding:15px; border-radius:8px; line-height:1.4;'>" + "\n".join(list(log_buffer.buffer)) + "</pre>", 200
 
 # ============================================================
 # LINE Event Listeners
