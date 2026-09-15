@@ -262,7 +262,7 @@ Here is the Glossary of specific terms you MUST use:
             
             generation_config = {
                 "temperature": 0.2,
-                "max_output_tokens": 500,
+                "max_output_tokens": 3000,
             }
             model = genai.GenerativeModel("gemini-2.5-flash", system_instruction=prompt, generation_config=generation_config)
             chat = model.start_chat(history=existing_history)
@@ -330,8 +330,21 @@ Here is the Glossary of specific terms you can reference:
 # ============================================================
 def reply_to_line(reply_token: str, text: str, target_id: str = None, user_id: str = None) -> bool:
     target = target_id or user_id
+    if not text:
+        return False
+
+    # LINE TextSendMessage จำกัดไม่เกิน 5,000 ตัวอักษรต่อ 1 บับเบิ้ล
+    # ถ้าข้อความยาวเกิน 4,500 ตัวอักษร ให้แบ่งเป็นหลายบับเบิ้ลต่อเนื่องกัน
+    max_chunk = 4500
+    if len(text) <= max_chunk:
+        messages = [TextSendMessage(text=text)]
+    else:
+        chunks = [text[i:i + max_chunk] for i in range(0, len(text), max_chunk)]
+        # LINE reply_message อนุญาตให้ส่ง Message objects ได้สูงสุด 5 รายการในครั้งเดียว
+        messages = [TextSendMessage(text=c) for c in chunks[:5]]
+
     try:
-        line_bot_api.reply_message(reply_token, TextSendMessage(text=text))
+        line_bot_api.reply_message(reply_token, messages)
         print("✅ ตอบกลับผ่าน LINE reply_token สำเร็จ")
         return True
     except Exception as e:
@@ -339,7 +352,7 @@ def reply_to_line(reply_token: str, text: str, target_id: str = None, user_id: s
         if target:
             try:
                 print(f"🔄 กำลังลองส่งข้อความผ่าน push_message ไปยัง Target: {target}...")
-                line_bot_api.push_message(target, TextSendMessage(text=text))
+                line_bot_api.push_message(target, messages)
                 print("✅ ส่งผ่าน push_message สำเร็จ!")
                 return True
             except Exception as push_err:
@@ -471,6 +484,13 @@ def process_text_message(reply_token: str, user_id: str, text: str, target_id: s
             chat = get_translate_chat(session_key)
             
         response = chat.send_message(query_text)
+        try:
+            if response.candidates and response.candidates[0].finish_reason:
+                fr_name = getattr(response.candidates[0].finish_reason, 'name', str(response.candidates[0].finish_reason))
+                if "MAX_TOKENS" in fr_name:
+                    print(f"⚠️ Warning: ข้อความถูกตัดจบเนื่องจากชนเพดาน Token! (finish_reason: {fr_name})")
+        except Exception:
+            pass
         translated_text = response.text.strip()
         delivered = reply_to_line(reply_token, translated_text, target_id=target)
         if delivered:
