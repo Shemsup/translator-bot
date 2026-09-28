@@ -502,85 +502,141 @@ def process_text_message(reply_token: str, user_id: str, text: str, target_id: s
         reply_to_line(reply_token, f"❌ เกิดข้อผิดพลาดในการประมวลผล AI: {e}", target_id=target)
 
 # ============================================================
-# 📁 ตัวประมวลผลรูปภาพ อัปโหลดเข้า Google Drive (Image Mode)
+# 📁 ระบบคิวและอัปโหลดไฟล์เข้า Google Drive (GAS WebApp With Retry)
 # ============================================================
-def process_image_message(reply_token: str, user_id: str, message_id: str, target_id: str = None):
+# Lock เพื่อรับประกันการอัปโหลดเข้า GAS เป็นแบบ Sequential (ทีละ 1 ไฟล์)
+# ป้องกันปัญหา Concurrency Limit และ Read Timeout ของ Google Apps Script ได้ 100%
+gas_upload_lock = threading.Lock()
+
+def upload_to_gas_with_retry(filename: str, file_bytes: bytes, max_retries: int = 3) -> dict:
+    if not GAS_WEBAPP_URL:
+        raise Exception("ไม่ได้ตั้งค่า GAS_WEBAPP_URL บนระบบคลาวด์")
+    if not DRIVE_FOLDER_ID:
+        raise Exception("ไม่ได้ตั้งค่า DRIVE_FOLDER_ID บนระบบคลาวด์")
+
+    import base64
+    base64_str = base64.b64encode(file_bytes).decode("utf-8")
+    payload = {
+        "action": "upload_image",
+        "folder_id": DRIVE_FOLDER_ID,
+        "filename": filename,
+        "base64_data": base64_str
+    }
+
+    with gas_upload_lock:
+        last_error = None
+        for attempt in range(1, max_retries + 1):
+            try:
+                # ตั้ง timeout 45 วินาที เพื่อรองรับรูปความละเอียดสูง
+                res = requests.post(GAS_WEBAPP_URL, json=payload, timeout=45)
+                res.raise_for_status()
+                data = res.json()
+                if data.get("status") == "success":
+                    return data
+                else:
+                    err_msg = data.get("message", "GAS returned failure")
+                    last_error = Exception(f"GAS API Error: {err_msg}")
+                    print(f"⚠️ GAS attempt {attempt}/{max_retries} error for {filename}: {err_msg}")
+            except Exception as e:
+                last_error = e
+                print(f"⚠️ GAS attempt {attempt}/{max_retries} failed for {filename}: {e}")
+
+            if attempt < max_retries:
+                sleep_time = 2 * attempt
+                print(f"⏳ รอรอบถัดไป {sleep_time} วินาทีก่อนลองใหม่ ({filename})...")
+                time.sleep(sleep_time)
+
+        raise last_error
+
+# ============================================================
+# 📦 ระบบ Batch Debounce Collector สำหรับรวบรวมรูปภาพที่ส่งพร้อมกัน
+# ============================================================
+image_batch_lock = threading.Lock()
+active_image_batches = {}
+
+def enqueue_image_message(reply_token: str, user_id: str, message_id: str, target_id: str):
     target = target_id or user_id
-    print(f"📸 ได้รับรูปภาพจาก LINE (User ID: {user_id}, Target: {target})")
-    
-    # 1. เช็กสิทธิ์ผู้ใช้งาน (รองรับทั้งคุณเช็ม, คุณเกียร์, และสมาชิกในกลุ่มฟาร์มกุ้ง)
     if not is_user_allowed(user_id, target_id):
         print(f"❌ Blocked image from unauthorized User ID: {user_id}")
         return
 
-    # 2. เช็กการตั้งค่าโฟลเดอร์ Google Drive
-    if not DRIVE_FOLDER_ID:
-        print("❌ Error: DRIVE_FOLDER_ID is not set in Environment Variables")
-        reply_to_line(reply_token, "❌ ระบบยังไม่ได้ตั้งค่า DRIVE_FOLDER_ID ในระบบคลาวด์ ไม่สามารถอัปโหลดรูปภาพได้ครับ", target_id=target)
+    with image_batch_lock:
+        if target not in active_image_batches:
+            active_image_batches[target] = {
+                "items": [],
+                "timer": None
+            }
+
+        batch = active_image_batches[target]
+        batch["items"].append({
+            "message_id": message_id,
+            "reply_token": reply_token,
+            "user_id": user_id,
+            "target_id": target,
+            "timestamp": time.time()
+        })
+
+        # รีเซ็ต Timer หน่วงเวลา 2.0 วินาที เพื่อรอรวบรวมรูปที่ส่งมาในชุดเดียวกัน
+        if batch["timer"]:
+            batch["timer"].cancel()
+
+        timer = threading.Timer(2.0, process_image_batch, args=(target,))
+        batch["timer"] = timer
+        timer.start()
+
+def process_image_batch(target_id: str):
+    with image_batch_lock:
+        batch = active_image_batches.pop(target_id, None)
+
+    if not batch or not batch["items"]:
         return
 
-    try:
-        # a. ดาวน์โหลดไฟล์รูปภาพจาก LINE Content API
-        url = f"https://api-data.line.me/v2/bot/message/{message_id}/content"
-        headers = {"Authorization": f"Bearer {CHANNEL_ACCESS_TOKEN}"}
-        response = requests.get(url, headers=headers, timeout=20)
-        response.raise_for_status()
-        image_bytes = response.content
+    items = batch["items"]
+    total_count = len(items)
+    print(f"📦 เริ่มประมวลผลชุดรูปภาพ {total_count} รูป สำหรับ Target: {target_id}...")
 
-        # b. ใช้ชื่อไฟล์จาก LINE Message ID ตรงๆ ({message_id}.jpg) เพื่อให้ระบบอื่นตรวจไฟล์ซ้ำได้
-        ext = "jpg"
-        content_type = response.headers.get("Content-Type", "").lower()
-        if "png" in content_type:
-            ext = "png"
-        filename = f"{message_id}.{ext}"
+    # ใช้ reply_token ล่าสุดในชุด
+    latest_reply_token = items[-1]["reply_token"]
+    user_id = items[-1]["user_id"]
 
-        # c. อัปโหลดไฟล์เข้า Google Drive
-        # 1. วิธีหลัก: ผ่าน GAS WebApp (รวดเร็ว ~1.5 วินาที และใช้พื้นที่บัญชีส่วนตัวของคุณเช็มโดยตรง ไม่ติด Quota Limit)
-        if GAS_WEBAPP_URL:
-            try:
-                import base64
-                base64_str = base64.b64encode(image_bytes).decode("utf-8")
-                payload = {
-                    "action": "upload_image",
-                    "folder_id": DRIVE_FOLDER_ID,
-                    "filename": filename,
-                    "base64_data": base64_str
-                }
-                gas_res = requests.post(GAS_WEBAPP_URL, json=payload, timeout=20)
-                gas_res.raise_for_status()
-                gas_data = gas_res.json()
-                if gas_data.get("status") == "success":
-                    print(f"✅ อัปโหลดไฟล์ {filename} ผ่าน GAS WebApp สำเร็จ! (File ID: {gas_data.get('id')})")
-                    reply_to_line(reply_token, "ได้รับรูปแล้ว บันทึกเข้าระบบฟาร์มกุ้งเรียบร้อยครับ 📁", target_id=target)
-                    return
-                else:
-                    print(f"⚠️ GAS WebApp error: {gas_data.get('message')}")
-            except Exception as gas_err:
-                print(f"⚠️ GAS Upload failed ({gas_err}), trying Service Account fallback...")
+    success_count = 0
+    failed_items = []
 
-        # 2. วิธีสำรอง: ผ่าน Google Drive API v3 โดยตรง
-        drive_service = get_drive_service()
-        if drive_service:
-            file_metadata = {
-                "name": filename,
-                "parents": [DRIVE_FOLDER_ID]
-            }
-            media = MediaIoBaseUpload(io.BytesIO(image_bytes), mimetype="image/jpeg", resumable=True)
-            uploaded_file = drive_service.files().create(
-                body=file_metadata,
-                media_body=media,
-                fields="id",
-                supportsAllDrives=True
-            ).execute()
-            print(f"✅ อัปโหลดไฟล์ {filename} เข้า Google Drive สำเร็จ! (File ID: {uploaded_file.get('id')})")
-            reply_to_line(reply_token, "ได้รับรูปแล้ว บันทึกเข้าระบบฟาร์มกุ้งเรียบร้อยครับ 📁", target_id=target)
-            return
+    for idx, item in enumerate(items, 1):
+        msg_id = item["message_id"]
+        try:
+            # 1. ดาวน์โหลดไฟล์รูปภาพจาก LINE Content API
+            url = f"https://api-data.line.me/v2/bot/message/{msg_id}/content"
+            headers = {"Authorization": f"Bearer {CHANNEL_ACCESS_TOKEN}"}
+            response = requests.get(url, headers=headers, timeout=25)
+            response.raise_for_status()
+            image_bytes = response.content
 
-        raise Exception("ไม่สามารถอัปโหลดได้ทั้งช่องทาง GAS WebApp และ Drive API")
+            # 2. นามสกุลไฟล์
+            ext = "png" if "png" in response.headers.get("Content-Type", "").lower() else "jpg"
+            filename = f"{msg_id}.{ext}"
 
-    except Exception as e:
-        print(f"❌ เกิดข้อผิดพลาดในการอัปโหลดรูปภาพเข้า Google Drive: {e}")
-        reply_to_line(reply_token, f"❌ เกิดข้อผิดพลาดในการบันทึกรูปภาพเข้าระบบ Google Drive: {e}", target_id=target)
+            # 3. อัปโหลดเข้า Google Drive ผ่าน GAS WebApp แบบมีคิวและ Retry
+            res_data = upload_to_gas_with_retry(filename, image_bytes)
+            print(f"✅ ({idx}/{total_count}) อัปโหลด {filename} ผ่าน GAS WebApp สำเร็จ! (File ID: {res_data.get('id')})")
+            success_count += 1
+        except Exception as e:
+            print(f"❌ ({idx}/{total_count}) อัปโหลดรูป {msg_id} ล้มเหลว: {e}")
+            failed_items.append(msg_id)
+
+    # 4. ส่งข้อความสรุปผลกลับไปยัง LINE เพียง 1 ข้อความ (ไม่รกแชท และประหยัดโควตา Push Message)
+    if total_count == 1:
+        if success_count == 1:
+            reply_to_line(latest_reply_token, "ได้รับรูปแล้ว บันทึกเข้าระบบฟาร์มกุ้งเรียบร้อยครับ 📁", target_id=target_id, user_id=user_id)
+        else:
+            reply_to_line(latest_reply_token, "❌ ไม่สามารถบันทึกรูปภาพได้ กรุณาลองใหม่อีกครั้งครับ", target_id=target_id, user_id=user_id)
+    else:
+        if success_count == total_count:
+            reply_to_line(latest_reply_token, f"✅ ได้รับรูปภาพครบทั้ง {total_count} รูป บันทึกเข้าระบบฟาร์มกุ้งเรียบร้อยครับ 📁", target_id=target_id, user_id=user_id)
+        elif success_count > 0:
+            reply_to_line(latest_reply_token, f"⚠️ บันทึกรูปภาพสำเร็จ {success_count}/{total_count} รูป (มี {len(failed_items)} รูปขัดข้อง) เข้าระบบฟาร์มกุ้งแล้วครับ 📁", target_id=target_id, user_id=user_id)
+        else:
+            reply_to_line(latest_reply_token, f"❌ เกิดข้อผิดพลาด ไม่สามารถบันทึกรูปภาพทั้ง {total_count} รูปได้ กรุณาลองใหม่อีกครั้งครับ", target_id=target_id, user_id=user_id)
 
 # ============================================================
 # 📄 ตัวประมวลผลไฟล์เอกสาร เช่น บิล PDF จากซัพพลายเออร์ (File Mode)
@@ -588,7 +644,7 @@ def process_image_message(reply_token: str, user_id: str, message_id: str, targe
 def process_file_message(reply_token: str, user_id: str, message_id: str, original_filename: str, target_id: str = None):
     target = target_id or user_id
     print(f"📄 ได้รับไฟล์เอกสารจาก LINE: {original_filename} (User ID: {user_id}, Target: {target})")
-    
+
     if not is_user_allowed(user_id, target_id):
         print(f"❌ Blocked file from unauthorized User ID: {user_id}")
         return
@@ -600,33 +656,14 @@ def process_file_message(reply_token: str, user_id: str, message_id: str, origin
     try:
         url = f"https://api-data.line.me/v2/bot/message/{message_id}/content"
         headers = {"Authorization": f"Bearer {CHANNEL_ACCESS_TOKEN}"}
-        response = requests.get(url, headers=headers, timeout=25)
+        response = requests.get(url, headers=headers, timeout=30)
         response.raise_for_status()
         file_bytes = response.content
 
         safe_filename = original_filename or f"{message_id}.pdf"
-
-        if GAS_WEBAPP_URL:
-            try:
-                import base64
-                base64_str = base64.b64encode(file_bytes).decode("utf-8")
-                payload = {
-                    "action": "upload_image",
-                    "folder_id": DRIVE_FOLDER_ID,
-                    "filename": safe_filename,
-                    "base64_data": base64_str
-                }
-                gas_res = requests.post(GAS_WEBAPP_URL, json=payload, timeout=25)
-                gas_res.raise_for_status()
-                gas_data = gas_res.json()
-                if gas_data.get("status") == "success":
-                    print(f"✅ อัปโหลดไฟล์เอกสาร {safe_filename} ผ่าน GAS WebApp สำเร็จ! (File ID: {gas_data.get('id')})")
-                    reply_to_line(reply_token, f"ได้รับเอกสาร \"{safe_filename}\" บันทึกเข้าระบบฟาร์มกุ้งเรียบร้อยครับ 📁", target_id=target)
-                    return
-            except Exception as gas_err:
-                print(f"⚠️ GAS File Upload failed ({gas_err})")
-
-        reply_to_line(reply_token, "⚠️ ไม่สามารถบันทึกเอกสารไฟล์ได้ กรุณาลองใหม่อีกครั้ง", target_id=target)
+        res_data = upload_to_gas_with_retry(safe_filename, file_bytes)
+        print(f"✅ อัปโหลดไฟล์เอกสาร {safe_filename} ผ่าน GAS WebApp สำเร็จ! (File ID: {res_data.get('id')})")
+        reply_to_line(reply_token, f"ได้รับเอกสาร \"{safe_filename}\" บันทึกเข้าระบบฟาร์มกุ้งเรียบร้อยครับ 📁", target_id=target)
     except Exception as e:
         print(f"❌ เกิดข้อผิดพลาดในการอัปโหลดไฟล์: {e}")
         reply_to_line(reply_token, f"❌ เกิดข้อผิดพลาดในการบันทึกเอกสาร: {e}", target_id=target)
@@ -694,10 +731,8 @@ def handle_image_message(event):
     message_id = event.message.id
     reply_token = event.reply_token
     
-    print(f"📸 ได้รับข้อความภาพจาก User ID: {user_id} (Target: {target_id})")
-    
-    thread = threading.Thread(target=process_image_message, args=(reply_token, user_id, message_id, target_id))
-    thread.start()
+    print(f"📸 ได้รับข้อความภาพ ID: {message_id} จาก User: {user_id} (Target: {target_id})")
+    enqueue_image_message(reply_token, user_id, message_id, target_id)
 
 @handler.add(MessageEvent, message=FileMessage)
 def handle_file_message(event):
