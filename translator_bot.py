@@ -242,6 +242,13 @@ Your tasks:
 5. If there are mixed languages, translate the part that is not the target language of the reader.
 6. STRICTLY NO CONVERSATIONAL FILLER, NO EXPLANATIONS, NO PINYIN, NO VOCABULARY BREAKDOWNS. Output ONLY the translated text.
 7. Consider the conversation history for context, but only translate the LATEST message sent by the user.
+8. STRICT PERSONNEL & TITLE RULES:
+   - In Thai translations, ALWAYS use "พี่" instead of "คุณ". NEVER use "คุณ" under any circumstances.
+   - Specific Person / Role Mappings:
+     * พี่หญิง <-> 地主太太
+     * พี่โอ๋ <-> 地主
+     * พี่สุธรรม <-> 大经理
+     * พี่บุญสม <-> bomsom
 
 Here is the Glossary of specific terms you MUST use:
 <glossary>
