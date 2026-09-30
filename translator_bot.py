@@ -497,9 +497,83 @@ def process_text_message(reply_token: str, user_id: str, text: str, target_id: s
             print("✅ ประมวลผลและส่งข้อความผ่าน LINE สำเร็จ")
         else:
             print("⚠️ ประมวลผลสำเร็จ แต่ส่งข้อความผ่าน LINE ล้มเหลว")
+            
+        # บันทึก Chat Log ลงคิวเพื่อนำไปสกัดความรู้ประจำวัน
+        enqueue_chat_log(user_id, target, query_text, translated_text, mode="explain" if is_explain_mode else "translate")
     except Exception as e:
         print(f"❌ Error during Gemini processing: {e}")
         reply_to_line(reply_token, f"❌ เกิดข้อผิดพลาดในการประมวลผล AI: {e}", target_id=target)
+
+# ============================================================
+# 📝 ระบบสะสมและบันทึก Chat Log ลง Google Sheet (Async Batched Queue)
+# ============================================================
+chat_log_queue = deque()
+chat_log_lock = threading.Lock()
+CHAT_LOG_BATCH_SIZE = 5
+CHAT_LOG_FLUSH_INTERVAL = 30.0  # ตรวจสอบและส่งทุก 30 วินาที
+
+def enqueue_chat_log(user_id: str, target_id: str, raw_text: str, translated_text: str, mode: str = "translate"):
+    if not raw_text or not translated_text:
+        return
+    th_now = datetime.now(timezone(timedelta(hours=7))).strftime("%Y-%m-%d %H:%M:%S")
+    entry = {
+        "timestamp": th_now,
+        "user_id": user_id or "unknown",
+        "target_id": target_id or "direct",
+        "mode": mode,
+        "raw_text": raw_text,
+        "translated_text": translated_text
+    }
+    with chat_log_lock:
+        chat_log_queue.append(entry)
+        q_len = len(chat_log_queue)
+    print(f"📝 บันทึก Chat Log เข้าคิว (สะสม: {q_len} รายการ)")
+    if q_len >= CHAT_LOG_BATCH_SIZE:
+        threading.Thread(target=flush_chat_logs, daemon=True).start()
+
+def flush_chat_logs():
+    with chat_log_lock:
+        if not chat_log_queue:
+            return
+        entries_to_flush = list(chat_log_queue)
+        chat_log_queue.clear()
+        
+    if not GAS_WEBAPP_URL:
+        print("⚠️ ไม่พบการตั้งค่า GAS_WEBAPP_URL ข้ามการส่ง Chat Log ไป Google Sheets")
+        return
+
+    payload = {
+        "action": "log_chat",
+        "entries": entries_to_flush
+    }
+    try:
+        res = requests.post(GAS_WEBAPP_URL, json=payload, timeout=15)
+        res.raise_for_status()
+        res_data = res.json()
+        if res_data.get("status") == "success":
+            print(f"✅ บันทึก Chat Log {len(entries_to_flush)} รายการลง Google Sheet สำเร็จ!")
+        else:
+            print(f"⚠️ GAS log_chat warning: {res_data.get('message')}")
+    except Exception as e:
+        print(f"⚠️ ส่ง Chat Log ไปยัง GAS ล้มเหลว (เก็บกลับเข้าคิว): {e}")
+        with chat_log_lock:
+            for item in reversed(entries_to_flush):
+                chat_log_queue.appendleft(item)
+
+def chat_log_flusher_daemon():
+    """ตรวจดูและส่ง Log เข้า Google Sheet เป็นระยะแบบอัตโนมัติ"""
+    time.sleep(20)
+    while True:
+        try:
+            with chat_log_lock:
+                has_items = len(chat_log_queue) > 0
+            if has_items:
+                flush_chat_logs()
+        except Exception as e:
+            print(f"⚠️ Error in chat_log_flusher_daemon: {e}")
+        time.sleep(CHAT_LOG_FLUSH_INTERVAL)
+
+threading.Thread(target=chat_log_flusher_daemon, daemon=True).start()
 
 # ============================================================
 # 📁 ระบบคิวและอัปโหลดไฟล์เข้า Google Drive (GAS WebApp With Retry)
