@@ -248,7 +248,8 @@ Your tasks:
      * พี่หญิง <-> 地主太太
      * พี่โอ๋ <-> 地主
      * พี่สุธรรม <-> 大经理
-     * พี่บุญสม <-> bomsom
+     * พี่บุญสม <-> bomsom / Boonsom (When translating from Chinese/English to Thai, ALWAYS translate "Boonsom" or "bomsom" as "พี่บุญสม")
+     * เกียร์ <-> 小嘉 (When translating from Chinese to Thai, "小嘉" must be translated as "เกียร์")
 
 Here is the Glossary of specific terms you MUST use:
 <glossary>
@@ -269,7 +270,7 @@ Here is the Glossary of specific terms you MUST use:
             
             generation_config = {
                 "temperature": 0.2,
-                "max_output_tokens": 3000,
+                "max_output_tokens": 8192,
             }
             model = genai.GenerativeModel("gemini-2.5-flash", system_instruction=prompt, generation_config=generation_config)
             chat = model.start_chat(history=existing_history)
@@ -318,7 +319,11 @@ Here is the Glossary of specific terms you can reference:
                 except Exception:
                     existing_history = []
 
-            model = genai.GenerativeModel("gemini-2.5-flash", system_instruction=prompt)
+            generation_config = {
+                "temperature": 0.2,
+                "max_output_tokens": 8192,
+            }
+            model = genai.GenerativeModel("gemini-2.5-flash", system_instruction=prompt, generation_config=generation_config)
             chat = model.start_chat(history=existing_history)
             chat_sessions_explain[user_id] = {
                 "chat": chat,
